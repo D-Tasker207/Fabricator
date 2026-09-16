@@ -124,7 +124,10 @@ function seedFromBrowser() {
   const browser = store.fileBrowser
   if (!browser || browser.loading || !browser.entries?.length) return
   const path = browser.currentPath || ROOT
-  if (!childrenByPath.value.has(path)) childrenByPath.value.set(path, browser.entries)
+  // Always adopt it rather than only filling a gap: the browser has just
+  // fetched this folder, so it is never older than the cache — and after an
+  // upload or a delete it is the only copy that reflects the change.
+  childrenByPath.value.set(path, browser.entries)
 }
 
 function prime() {

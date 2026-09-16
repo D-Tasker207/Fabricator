@@ -74,6 +74,12 @@ _NEVER = [
     ("GET", "/api/servers/<server_id>/files/content"),
     ("GET", "/api/servers/<server_id>/files/search"),
     ("PUT", "/api/servers/<server_id>/files/content"),
+    # File-manager writes (#73). The caller supplies both the bytes and the
+    # destination, so this is strictly broader than the content PUT above —
+    # planting a jar in mods/ is arbitrary code execution at next start.
+    ("POST", "/api/servers/<server_id>/files/upload"),
+    ("POST", "/api/servers/<server_id>/files/folder"),
+    ("DELETE", "/api/servers/<server_id>/files"),
     ("PUT", "/api/servers/<server_id>/autostart"),
     ("DELETE", "/api/servers/<server_id>"),
     ("POST", "/api/servers"),

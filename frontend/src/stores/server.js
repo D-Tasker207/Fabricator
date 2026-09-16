@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { useRouter } from 'vue-router'
 import {
@@ -26,7 +26,10 @@ import {
   searchServerFiles,
   deleteServer,
   getServerFile,
-  saveServerFile
+  saveServerFile,
+  uploadServerFile,
+  deleteServerFiles,
+  createServerFolder
 } from '../api/servers'
 import { useToast } from '../composables/useToast'
 import {
@@ -82,6 +85,16 @@ function isTextFile(path) {
   const segments = path.toLowerCase().split('.')
   const extension = segments.pop() || ''
   return TEXT_FILE_EXTENSIONS.has(extension)
+}
+
+// Relative paths come off the backend with the host's separator, so a Windows
+// install reports `mods\\a.jar` where Linux reports `mods/a.jar`. Normalise
+// before comparing, or deleting a folder wouldn't close the file open beneath it.
+function isPathInside(childPath, ancestorPath) {
+  const child = String(childPath || '').replace(/\\/g, '/')
+  const ancestor = String(ancestorPath || '').replace(/\\/g, '/')
+  if (!child || !ancestor) return false
+  return child === ancestor || child.startsWith(`${ancestor}/`)
 }
 
 export const useServerStore = defineStore('server', () => {
@@ -583,6 +596,142 @@ export const useServerStore = defineStore('server', () => {
 
   function enterFileEntry(entry) {
     if (entry.isDir) openFileBrowser(entry.relativePath)
+  }
+
+  // Per-file upload rows the Files page renders as a progress list. Keyed by a
+  // local id rather than the filename so two uploads of the same name (a retry
+  // after a replace prompt, say) stay distinct rows.
+  const fileUploads = ref([])
+  let uploadRowId = 0
+
+  function clearFinishedUploads() {
+    fileUploads.value = fileUploads.value.filter((row) => row.status === 'uploading')
+  }
+
+  function cancelUpload(id) {
+    const row = fileUploads.value.find((entry) => entry.id === id)
+    row?.abort?.()
+  }
+
+  /**
+   * Upload files into the folder currently open in the browser.
+   *
+   * Sequential rather than parallel: a handful of large jars over a home
+   * upstream link finish sooner one at a time than interleaved, and one
+   * moving progress bar reads better than six stalled ones.
+   *
+   * Returns the names that hit an existing file so the caller can offer to
+   * replace them — the backend refuses by default rather than clobbering.
+   */
+  async function uploadFiles(files, { overwrite = false } = {}) {
+    const list = Array.from(files || [])
+    if (!list.length) return { uploaded: [], conflicts: [] }
+
+    const dirPath = fileBrowser.value.currentPath || ''
+    const uploaded = []
+    const conflicts = []
+
+    for (const file of list) {
+      const row = reactive({
+        id: ++uploadRowId,
+        name: file.name,
+        pct: 0,
+        status: 'uploading',
+        error: null,
+        abort: null,
+      })
+      fileUploads.value = [...fileUploads.value, row]
+
+      try {
+        await uploadServerFile(currentServerId.value, dirPath, file, {
+          overwrite,
+          onProgress: (pct) => { row.pct = pct },
+          registerAbort: (abort) => { row.abort = abort },
+        })
+        row.status = 'done'
+        uploaded.push(file.name)
+      } catch (error) {
+        row.status = 'failed'
+        row.error = error?.message || 'Upload failed'
+        if (error?.status === 409 && error?.data?.code === 'file-exists') {
+          conflicts.push(file)
+        } else if (error?.message !== 'Upload cancelled') {
+          toast.error(`${file.name}: ${row.error}`, 'Files')
+        }
+      }
+    }
+
+    if (uploaded.length) {
+      toast.success(
+        uploaded.length === 1 ? `Uploaded ${uploaded[0]}` : `Uploaded ${uploaded.length} files`,
+        'Files'
+      )
+      await openFileBrowser(dirPath)
+    }
+
+    // Successful rows are transient; failures stay up until the user dismisses
+    // them or starts another upload, so an error isn't missed in a long list.
+    fileUploads.value = fileUploads.value.filter((entry) => entry.status === 'failed')
+    return { uploaded, conflicts }
+  }
+
+  /**
+   * Delete entries from the folder currently open in the browser.
+   *
+   * Resolves `{ deleted, errors, needsRecursive }` — `needsRecursive` holds the
+   * non-empty folders the backend declined to remove, so the caller can confirm
+   * once and call again with `recursive`.
+   */
+  async function deleteFileEntries(paths, { recursive = false } = {}) {
+    const list = (Array.isArray(paths) ? paths : [paths]).filter(Boolean)
+    if (!list.length) return { deleted: [], errors: [], needsRecursive: [] }
+
+    let result
+    try {
+      result = await deleteServerFiles(currentServerId.value, list, { recursive })
+    } catch (error) {
+      const message = error?.message || 'Delete failed'
+      toast.error(message, 'Files')
+      return { deleted: [], errors: [{ error: message }], needsRecursive: [] }
+    }
+
+    const deleted = result.deleted || []
+    const errors = result.errors || []
+    const needsRecursive = errors.filter((entry) => entry.code === 'not-empty').map((entry) => entry.path)
+
+    // A deleted file that is open in the editor would otherwise leave the page
+    // guarding unsaved changes for something that no longer exists.
+    if (fileEditor.value.path && deleted.some((path) => isPathInside(fileEditor.value.path, path))) {
+      closeFile()
+    }
+
+    if (deleted.length) {
+      toast.success(
+        deleted.length === 1 ? `Deleted ${deleted[0]}` : `Deleted ${deleted.length} items`,
+        'Files'
+      )
+      await openFileBrowser(fileBrowser.value.currentPath || '')
+    }
+
+    for (const entry of errors) {
+      if (entry.code === 'not-empty') continue
+      toast.error(entry.path ? `${entry.path}: ${entry.error}` : entry.error, 'Files')
+    }
+
+    return { deleted, errors, needsRecursive }
+  }
+
+  async function createFolder(name) {
+    const dirPath = fileBrowser.value.currentPath || ''
+    try {
+      await createServerFolder(currentServerId.value, dirPath, name)
+      toast.success(`Created ${name}`, 'Files')
+      await openFileBrowser(dirPath)
+      return true
+    } catch (error) {
+      toast.error(error?.message || 'Could not create folder', 'Files')
+      return false
+    }
   }
 
   // Bumped on every search/clear so a slow response from an abandoned query
@@ -1376,6 +1525,7 @@ export const useServerStore = defineStore('server', () => {
     commandHistory,
     fileBrowser,
     fileEditor,
+    fileUploads,
     fileSearch,
     showDeleteServerModal,
     deletingServer,
@@ -1434,6 +1584,11 @@ export const useServerStore = defineStore('server', () => {
     openFileBrowser,
     enterFileEntry,
     goUpDirectory,
+    uploadFiles,
+    cancelUpload,
+    clearFinishedUploads,
+    deleteFileEntries,
+    createFolder,
     searchFiles,
     clearFileSearch,
     revealSearchHit,
