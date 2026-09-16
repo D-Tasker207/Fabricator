@@ -3,7 +3,7 @@
  * Handles all server-related API requests
  */
 
-import { get, post, put, del } from './client'
+import { get, post, put, del, ApiError } from './client'
 
 /**
  * Get list of all servers
@@ -138,6 +138,101 @@ export async function getServerFile(serverId, path) {
  */
 export async function saveServerFile(serverId, path, content) {
   return put(`/api/servers/${serverId}/files/content`, { path, content })
+}
+
+/**
+ * Upload one file into a directory under the server's install path.
+ *
+ * The raw File is the request body (not multipart) to match the backend's
+ * streamed, size-capped upload routes. Callers upload one file per call and
+ * fan out over a multi-select themselves, which is what keeps per-file
+ * progress and per-file failure reporting possible.
+ *
+ * Uses XMLHttpRequest rather than fetch for the one thing fetch still can't
+ * do: upload progress events. Same shape as `uploadWorld` in ./backups.js.
+ *
+ * @param {string|number} serverId
+ * @param {string} dirPath - Relative destination folder ('' for the root)
+ * @param {File} file
+ * @param {object} [opts]
+ * @param {boolean} [opts.overwrite] - Replace an existing file of that name
+ * @param {(pct:number)=>void} [opts.onProgress] 0-100, or -1 when indeterminate
+ * @param {(abort:()=>void)=>void} [opts.registerAbort] receives a cancel fn
+ * @returns {Promise<Object>} `{ success, entry }`
+ */
+export function uploadServerFile(serverId, dirPath, file, { overwrite = false, onProgress, registerAbort } = {}) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    // encodeURIComponent matters more than it looks: a bare '+' in a query
+    // string decodes to a space, which would rename every Fabric jar on the
+    // way in (fabric-api-0.102.0+1.21.jar -> fabric-api-0.102.0 1.21.jar).
+    const params = new URLSearchParams({ path: dirPath || '', filename: file.name })
+    if (overwrite) params.set('overwrite', 'true')
+
+    xhr.open('POST', `/api/servers/${serverId}/files/upload?${params.toString()}`)
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+
+    if (typeof registerAbort === 'function') {
+      registerAbort(() => xhr.abort())
+    }
+
+    xhr.upload.onprogress = (event) => {
+      if (typeof onProgress !== 'function') return
+      onProgress(event.lengthComputable ? Math.round((event.loaded / event.total) * 100) : -1)
+    }
+
+    xhr.onload = () => {
+      let data = {}
+      try {
+        data = JSON.parse(xhr.responseText || '{}')
+      } catch (_) {
+        data = {}
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(data)
+      } else {
+        reject(new ApiError(
+          data.error || data.message || `Upload failed with status ${xhr.status}`,
+          xhr.status,
+          data && Object.keys(data).length ? data : null
+        ))
+      }
+    }
+
+    xhr.onerror = () => reject(new ApiError('Network error during upload', 0, null))
+    xhr.onabort = () => reject(new ApiError('Upload cancelled', 0, null))
+
+    xhr.send(file)
+  })
+}
+
+/**
+ * Delete one or more entries under the server's install path.
+ *
+ * Always answers 200 with `{ success, deleted, errors }` so a partial failure
+ * in a multi-select reports per entry rather than sinking the batch. A
+ * non-empty folder comes back in `errors` with `code: 'not-empty'` unless
+ * `recursive` is set.
+ *
+ * @param {string|number} serverId
+ * @param {string[]} paths - Relative paths
+ * @param {object} [opts]
+ * @param {boolean} [opts.recursive] - Allow deleting non-empty folders
+ * @returns {Promise<{success:boolean, deleted:string[], errors:Array}>}
+ */
+export async function deleteServerFiles(serverId, paths, { recursive = false } = {}) {
+  return del(`/api/servers/${serverId}/files`, { paths, recursive })
+}
+
+/**
+ * Create a folder under the server's install path.
+ * @param {string|number} serverId
+ * @param {string} dirPath - Relative parent folder ('' for the root)
+ * @param {string} name - New folder name
+ * @returns {Promise<Object>} `{ success, entry }`
+ */
+export async function createServerFolder(serverId, dirPath, name) {
+  return post(`/api/servers/${serverId}/files/folder`, { path: dirPath || '', name })
 }
 
 /**

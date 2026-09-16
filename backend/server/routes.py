@@ -4,9 +4,11 @@ from pathlib import Path
 from typing import Optional
 import logging
 import os
+import re
 import shutil
 import stat
 import threading
+import uuid
 
 from flask import Blueprint, jsonify, request
 
@@ -34,7 +36,13 @@ from backend.server.locks import get_server_lock, try_acquire, discard_lock
 from backend.utils import platform as platform_utils
 from backend.utils.java import parse_java_major, parse_java_version_string
 from backend.utils.routes import require_server, with_server_lock
+from backend.utils.strings import bool_from_str
 from backend.utils.time import iso_z_from_timestamp, iso_z_now
+from backend.utils.upload import (
+    UploadTooLargeError,
+    env_max_bytes,
+    stream_upload_to_temp,
+)
 
 try:
     import psutil  # type: ignore
@@ -233,6 +241,111 @@ def _ensure_child_path(base: Path, child: str) -> Path:
     except ValueError as exc:
         raise ValueError('Invalid path') from exc
     return candidate
+
+
+# Upload cap for the file manager. Mod jars and configs are small, but this is
+# also the natural place to drop a world zip or a datapack, so the default is
+# generous and operators on small hosts can lower it. Enforced while the body
+# is streamed, so an oversized upload never lands on disk in full.
+_DEFAULT_MAX_FILE_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _max_file_upload_bytes() -> int:
+    """Return the configured file-manager upload cap in bytes."""
+    return env_max_bytes(
+        'FABRICATOR_MAX_FILE_UPLOAD_BYTES', _DEFAULT_MAX_FILE_UPLOAD_BYTES
+    )
+
+
+# Path separators on either platform, the NTFS alternate-data-stream colon, and
+# control characters. Everything else is allowed through — see
+# _sanitize_entry_name for why this is deliberately narrower than
+# werkzeug.secure_filename.
+_UNSAFE_NAME_CHARS = re.compile(r'[/\\:\x00-\x1f\x7f]')
+
+# Reserved on Windows with or without an extension, so CON.jar is a device too.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {'con', 'prn', 'aux', 'nul'}
+    | {f'com{i}' for i in range(1, 10)}
+    | {f'lpt{i}' for i in range(1, 10)}
+)
+
+
+def _sanitize_entry_name(raw: str) -> str:
+    """Return ``raw`` as a safe bare file/folder name, or raise ``ValueError``.
+
+    Deliberately *not* ``werkzeug.secure_filename``: that strips every
+    character outside ``[A-Za-z0-9_.-]``, which mangles the mod jars this
+    route exists to accept — ``fabric-api-0.102.0+1.21.jar`` would land as
+    ``fabric-api-0.102.01.21.jar``. The world-import route can afford that
+    because the name it sanitizes is only a display label; here it is the name
+    on disk, so a silent rename breaks re-uploading over an older copy and
+    leaves the file looking nothing like what the user downloaded.
+
+    What actually matters for safety is that the name cannot escape its
+    directory, address a Windows device, or change shape between validation
+    and creation. Containment is re-checked against the resolved path by
+    _ensure_child_path regardless.
+    """
+    name = (raw or '').strip()
+    if not name:
+        raise ValueError('A name is required')
+    if _UNSAFE_NAME_CHARS.search(name):
+        raise ValueError('Name may not contain path separators or control characters')
+    if name in {'.', '..'}:
+        raise ValueError('Invalid name')
+    # Windows silently drops trailing dots and spaces, so "mod.jar " would be
+    # validated under one name and created under another.
+    if name != name.rstrip('. '):
+        raise ValueError('Name may not end with a dot or a space')
+    if name.split('.')[0].lower() in _WINDOWS_RESERVED_NAMES:
+        raise ValueError('That name is reserved by the operating system')
+    if len(name.encode('utf-8')) > 255:
+        raise ValueError('Name is too long')
+    return name
+
+
+def _resolve_browse_dir(server: dict, relative_path: str) -> tuple[Path, Path]:
+    """Return ``(base_path, target_dir)`` for a relative directory parameter.
+
+    Both come back resolved so the caller can compare them and take
+    ``relative_to`` either way. Raises ``ValueError`` for anything outside the
+    install path.
+    """
+    base_path = _registry().resolve_install_path(server).resolve()
+    target_dir = (
+        _ensure_child_path(base_path, relative_path) if relative_path else base_path
+    )
+    return base_path, target_dir
+
+
+def _resolve_delete_target(base_path: Path, relative: str) -> Path:
+    """Return the literal path to delete, validated against ``base_path``.
+
+    Unlike :func:`_ensure_child_path` this does **not** resolve the final
+    component: deleting an entry that happens to be a symlink has to remove the
+    link, not whatever it points at. A ``world`` symlinked onto a second disk is
+    a normal setup for a big server, and rmtree-ing through the link would
+    destroy the real world while the panel reported a tidy success.
+
+    The parent chain is still resolved and contained, so the entry itself can
+    never be reached from outside the install path.
+    """
+    candidate = base_path / relative
+    # PurePath folds away "." while parsing, so `base / "."` *is* base — which
+    # makes this comparison the only place the server root can be recognised.
+    # It deliberately leaves ".." alone (it cannot know what a symlink resolves
+    # to), so that spelling is refused outright rather than guessed at.
+    if candidate == base_path:
+        raise ValueError('Refusing to delete the server folder itself')
+    if candidate.name in {'', '.', '..'}:
+        raise ValueError('Invalid path')
+    parent = candidate.parent.resolve()
+    try:
+        parent.relative_to(base_path)
+    except ValueError as exc:
+        raise ValueError('Invalid path') from exc
+    return parent / candidate.name
 
 
 def _get_installer(loader: str, install_path: Path):
@@ -789,6 +902,220 @@ def update_server_file_content(server_id, server):
         return jsonify({'error': f'Failed to write file: {exc}'}), 500
 
     return jsonify({'success': True})
+
+
+@server_bp.route('/servers/<server_id>/files/upload', methods=['POST'])
+@require_server
+def upload_server_file(server_id, server):
+    """Stream one uploaded file into a directory under the server's install path.
+
+    The raw bytes are the request body (``fetch(url, { body: file })``) rather
+    than multipart form data — the same shape as the world-import and .mrpack
+    uploads, because the cap has to be applied *while* the body is written and
+    multipart parsing buffers it first. The destination folder comes from
+    ``?path=`` and the name from ``?filename=`` or the ``X-Filename`` header.
+
+    One file per request: the client fans out over a multi-select, which is what
+    gives it per-file progress and lets one rejected file leave the rest alone.
+
+    Deliberately not wrapped in ``@with_server_lock``: a jar over a home upstream
+    link can take minutes, and holding the per-server lock for the whole stream
+    would 409 the Start the user is uploading mods in order to reach. The lock is
+    taken around the commit instead — the same split the world-import route
+    makes, and the only moment an install or a restore could actually collide.
+    """
+    dir_param = request.args.get('path', '').strip()
+    overwrite = bool_from_str(request.args.get('overwrite'))
+
+    raw_name = request.args.get('filename') or request.headers.get('X-Filename') or ''
+    try:
+        filename = _sanitize_entry_name(raw_name)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    try:
+        base_path, target_dir = _resolve_browse_dir(server, dir_param)
+        target = _ensure_child_path(target_dir, filename)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    if not target_dir.is_dir():
+        return jsonify({'error': 'Directory not found'}), 404
+
+    # _ensure_child_path resolves, so a symlink pointing *outside* the install
+    # path was already rejected above. One pointing back inside still needs
+    # stopping here: writing through it would silently rewrite a different file
+    # from the one the user is looking at.
+    if (target_dir / filename).is_symlink():
+        return jsonify({'error': f'{filename} is a symlink'}), 409
+
+    if target.is_dir():
+        return jsonify({'error': f'{filename} is a folder'}), 409
+
+    if target.exists() and not overwrite:
+        return jsonify({
+            'error': f'{filename} already exists',
+            'code': 'file-exists',
+            'name': filename,
+        }), 409
+
+    max_bytes = _max_file_upload_bytes()
+    if request.content_length and request.content_length > max_bytes:
+        return jsonify({'error': f'Upload exceeds the {max_bytes}-byte limit'}), 413
+
+    # Staged inside the destination directory so the commit below is a rename on
+    # one filesystem: atomic, and a half-written jar is never visible to the
+    # loader under its real name. The leading dot keeps it out of the way if the
+    # process dies between the two steps.
+    staged = target_dir / f'.fabricator-upload-{uuid.uuid4().hex}.part'
+    try:
+        written = stream_upload_to_temp(request.stream, staged, max_bytes=max_bytes)
+    except UploadTooLargeError as exc:
+        return jsonify({'error': str(exc)}), 413
+    except OSError as exc:
+        return jsonify({'error': f'Failed to save the upload: {exc}'}), 500
+
+    if written == 0:
+        staged.unlink(missing_ok=True)
+        return jsonify({'error': 'Empty upload — no file received'}), 400
+
+    lock = try_acquire(server_id)
+    if lock is None:
+        staged.unlink(missing_ok=True)
+        return jsonify(
+            {'error': 'Another operation is in progress for this server'}
+        ), 409
+
+    try:
+        os.replace(staged, target)
+    except OSError as exc:
+        staged.unlink(missing_ok=True)
+        return jsonify({'error': f'Failed to save the upload: {exc}'}), 500
+    finally:
+        lock.release()
+
+    logger.info(
+        'Uploaded %s (%d bytes) into %s on server %s',
+        filename, written, dir_param or '/', server_id,
+    )
+    return jsonify({
+        'success': True,
+        'entry': _serialize_file_entry(target, base_path),
+    }), 201
+
+
+@server_bp.route('/servers/<server_id>/files', methods=['DELETE'])
+@require_server
+@with_server_lock
+def delete_server_files(server_id, server):
+    """Delete one or more entries under the server's install path.
+
+    Takes ``{paths: [...], recursive: bool}`` and answers with the
+    ``{deleted, errors}`` shape the bulk mod delete uses, so one bad entry in a
+    multi-select doesn't sink the rest. A non-empty folder needs ``recursive``;
+    without it that entry comes back tagged ``code: 'not-empty'`` so the client
+    can ask before someone one-clicks their world away.
+    """
+    data = request.get_json(silent=True) or {}
+    paths = data.get('paths')
+    if isinstance(paths, str):
+        paths = [paths]
+    if not isinstance(paths, list) or not paths:
+        return jsonify({'error': 'paths must be a non-empty list'}), 400
+
+    recursive = bool(data.get('recursive'))
+
+    try:
+        base_path = _registry().resolve_install_path(server).resolve()
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    deleted = []
+    errors = []
+
+    for raw_path in paths:
+        relative = raw_path.strip() if isinstance(raw_path, str) else ''
+        if not relative:
+            errors.append({'path': raw_path, 'error': 'Path is required'})
+            continue
+
+        try:
+            target = _resolve_delete_target(base_path, relative)
+        except ValueError as exc:
+            errors.append({'path': relative, 'error': str(exc)})
+            continue
+
+        # exists() follows symlinks, so a dangling link needs the second check
+        # or it could never be cleaned up from the file manager.
+        if not target.exists() and not target.is_symlink():
+            errors.append({'path': relative, 'error': 'Not found'})
+            continue
+
+        try:
+            if target.is_symlink() or not target.is_dir():
+                _unlink_with_retry(target)
+            else:
+                if not recursive and any(target.iterdir()):
+                    errors.append({
+                        'path': relative,
+                        'error': f'{target.name} is not empty',
+                        'code': 'not-empty',
+                    })
+                    continue
+                shutil.rmtree(target, onerror=_handle_remove_readonly)
+        except OSError as exc:
+            # A running server holds its jar and world files open on Windows;
+            # report that per entry rather than failing the whole request.
+            errors.append({'path': relative, 'error': f'Could not delete: {exc}'})
+            continue
+
+        deleted.append(relative)
+
+    if deleted:
+        logger.info('Deleted %d entries from server %s', len(deleted), server_id)
+
+    return jsonify({'success': not errors, 'deleted': deleted, 'errors': errors})
+
+
+@server_bp.route('/servers/<server_id>/files/folder', methods=['POST'])
+@require_server
+@with_server_lock
+def create_server_folder(server_id, server):
+    """Create one folder under the server's install path.
+
+    Upload needs somewhere to land: a fresh vanilla install has no ``mods/`` and
+    often no ``config/``, so without this the file manager can't reach the
+    folders people actually hand-install into.
+    """
+    data = request.get_json(silent=True) or {}
+    dir_param = (data.get('path') or '').strip()
+
+    try:
+        name = _sanitize_entry_name(data.get('name') or '')
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    try:
+        base_path, parent_dir = _resolve_browse_dir(server, dir_param)
+        target = _ensure_child_path(parent_dir, name)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    if not parent_dir.is_dir():
+        return jsonify({'error': 'Directory not found'}), 404
+
+    if target.exists() or (parent_dir / name).is_symlink():
+        return jsonify({'error': f'{name} already exists', 'code': 'file-exists'}), 409
+
+    try:
+        target.mkdir()
+    except OSError as exc:
+        return jsonify({'error': f'Failed to create folder: {exc}'}), 500
+
+    return jsonify({
+        'success': True,
+        'entry': _serialize_file_entry(target, base_path),
+    }), 201
 
 
 @server_bp.route('/servers/<server_id>/mods', methods=['GET'])

@@ -8,12 +8,14 @@ import ConfirmModal from '../../components/modals/ConfirmModal.vue'
 import { formatFileSize } from '../../utils/format'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useServerStore } from '../../stores/server'
+import { useToast } from '../../composables/useToast'
 
 // Async-loaded so CodeMirror lands in its own chunk instead of the main bundle
 // (the Files route is imported statically by the router).
 const CodeEditor = defineAsyncComponent(() => import('../../components/ui/CodeEditor.vue'))
 
 const store = useServerStore()
+const toast = useToast()
 
 const editorRef = ref(null)
 const codeEditorRef = ref(null)
@@ -228,6 +230,197 @@ const isEditing = computed(() => Boolean(store.fileEditor.path) || store.fileEdi
 // the one path that checks for unsaved changes first.
 const onTreeSelect = (entry) => onFileClick(entry)
 
+// ---------- File operations (#73) ----------
+// Every entry point uploads into whichever folder the browser is showing, so
+// none of them carry a destination of their own.
+
+const fileInputRef = ref(null)
+const openFilePicker = () => fileInputRef.value?.click()
+
+const onFilesChosen = (event) => {
+  runUpload(event.target.files)
+  // Reset so picking the same file twice in a row still fires `change`.
+  event.target.value = ''
+}
+
+// Files the backend refused because that name is already taken, held between
+// the two halves of the replace prompt.
+const pendingReplace = ref([])
+const showReplaceConfirm = ref(false)
+
+const replaceMessage = computed(() => {
+  const count = pendingReplace.value.length
+  if (count === 1) return `${pendingReplace.value[0].name} already exists here.`
+  return `${count} files already exist here.`
+})
+
+const runUpload = async (files) => {
+  const { conflicts } = await store.uploadFiles(files)
+  if (conflicts.length) {
+    pendingReplace.value = conflicts
+    showReplaceConfirm.value = true
+  }
+}
+
+const handleReplaceConfirm = async () => {
+  const files = pendingReplace.value
+  showReplaceConfirm.value = false
+  pendingReplace.value = []
+  await store.uploadFiles(files, { overwrite: true })
+}
+
+const handleReplaceCancel = () => {
+  const skipped = pendingReplace.value.length
+  showReplaceConfirm.value = false
+  pendingReplace.value = []
+  // The rows for these were dropped with the prompt, so say what happened or
+  // the files would just silently not be there.
+  if (skipped) {
+    toast.info(
+      skipped === 1 ? 'Upload skipped — the file was left as it is' : `${skipped} uploads skipped`,
+      'Files'
+    )
+  }
+}
+
+// dragenter/dragleave fire again for every child element the pointer crosses,
+// so a plain boolean flickers as the cursor moves over rows. Count instead.
+const dragDepth = ref(0)
+const isDragging = computed(() => dragDepth.value > 0)
+
+const isFileDrag = (event) => Array.from(event.dataTransfer?.types || []).includes('Files')
+
+const onDragEnter = (event) => {
+  if (!isFileDrag(event)) return
+  event.preventDefault()
+  dragDepth.value += 1
+}
+
+const onDragOver = (event) => {
+  if (!isFileDrag(event)) return
+  // Without this the browser leaves the page to open the dropped file.
+  event.preventDefault()
+  event.dataTransfer.dropEffect = 'copy'
+}
+
+const onDragLeave = () => {
+  if (dragDepth.value > 0) dragDepth.value -= 1
+}
+
+const onDrop = (event) => {
+  if (!isFileDrag(event)) return
+  event.preventDefault()
+  dragDepth.value = 0
+
+  // A dropped folder shows up in `files` as a zero-byte entry that would upload
+  // as an empty file of the same name. Skip those and say so, rather than
+  // silently producing junk — recursive folder upload isn't wired up yet.
+  const items = Array.from(event.dataTransfer.items || [])
+  const dropped = Array.from(event.dataTransfer.files || [])
+  const files = dropped.filter((_, i) => !items[i]?.webkitGetAsEntry?.()?.isDirectory)
+
+  if (files.length < dropped.length) {
+    toast.error("Folders can't be uploaded yet — drop the files inside instead", 'Files')
+  }
+  if (files.length) runUpload(files)
+}
+
+// Delete runs in two passes for folders: the backend refuses a non-empty one
+// unless `recursive` is set, which is what stops a stray click taking out a
+// world that took months to build.
+const pendingDelete = ref([])
+const showDeleteConfirm = ref(false)
+const recursiveTargets = ref([])
+const showRecursiveConfirm = ref(false)
+const deleting = ref(false)
+
+const deleteMessage = computed(() => {
+  const entry = pendingDelete.value[0]
+  return entry ? `Delete ${entry.name}?` : 'Delete this item?'
+})
+
+const deleteDescription = computed(() => {
+  const entry = pendingDelete.value[0]
+  if (!entry) return ''
+  // Nothing about contents here — a folder with anything in it comes back from
+  // the backend for a second, explicit confirm, and promising the recursive
+  // delete up front would make that escalation read as a stutter.
+  return entry.isDir
+    ? 'Empty folders are removed straight away. This cannot be undone.'
+    : 'This removes the file from disk and cannot be undone.'
+})
+
+const onDeleteClick = (entry) => {
+  pendingDelete.value = [entry]
+  showDeleteConfirm.value = true
+}
+
+const handleDeleteConfirm = async () => {
+  const paths = pendingDelete.value.map((entry) => entry.relativePath || entry.name)
+  deleting.value = true
+  const { needsRecursive } = await store.deleteFileEntries(paths)
+  deleting.value = false
+  showDeleteConfirm.value = false
+  pendingDelete.value = []
+
+  if (needsRecursive.length) {
+    recursiveTargets.value = needsRecursive
+    showRecursiveConfirm.value = true
+  }
+}
+
+const handleDeleteCancel = () => {
+  showDeleteConfirm.value = false
+  pendingDelete.value = []
+}
+
+const recursiveMessage = computed(() => {
+  const targets = recursiveTargets.value
+  return targets.length === 1
+    ? `${targets[0]} is not empty.`
+    : `${targets.length} folders are not empty.`
+})
+
+const handleRecursiveConfirm = async () => {
+  const paths = recursiveTargets.value
+  deleting.value = true
+  await store.deleteFileEntries(paths, { recursive: true })
+  deleting.value = false
+  showRecursiveConfirm.value = false
+  recursiveTargets.value = []
+}
+
+const handleRecursiveCancel = () => {
+  showRecursiveConfirm.value = false
+  recursiveTargets.value = []
+}
+
+const showNewFolder = ref(false)
+const newFolderName = ref('')
+const creatingFolder = ref(false)
+
+const openNewFolder = () => {
+  newFolderName.value = ''
+  showNewFolder.value = true
+}
+
+const handleNewFolderConfirm = async () => {
+  const name = newFolderName.value.trim()
+  if (!name) return
+  creatingFolder.value = true
+  const ok = await store.createFolder(name)
+  creatingFolder.value = false
+  if (ok) {
+    showNewFolder.value = false
+    newFolderName.value = ''
+  }
+}
+
+const handleNewFolderCancel = () => {
+  showNewFolder.value = false
+  newFolderName.value = ''
+}
+
 const copyState = ref('idle')
 const onCopyPath = async () => {
   const path = store.fileBrowser.absolutePath
@@ -245,7 +438,26 @@ const onCopyPath = async () => {
          parent's column layout, which the wrapper would otherwise swallow. -->
     <!-- Browser chrome. Hidden while editing: the breadcrumb and Up button
          steer the flat listing, which the tree replaces. -->
-    <div v-if="!isEditing" class="files-page__browser">
+    <div
+      v-if="!isEditing"
+      class="files-page__browser"
+      :class="{ 'is-dragging': isDragging }"
+      @dragenter="onDragEnter"
+      @dragover="onDragOver"
+      @dragleave="onDragLeave"
+      @drop="onDrop"
+    >
+    <!-- Sits above the listing rather than replacing it, so the folder you are
+         about to drop into stays readable underneath. -->
+    <div v-if="isDragging" class="files-page__dropzone">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+        <path d="M12 16V4M12 4L7 9M12 4l5 5" stroke-linecap="round" stroke-linejoin="round" />
+        <path d="M4 16v2.5A1.5 1.5 0 005.5 20h13a1.5 1.5 0 001.5-1.5V16" stroke-linecap="round" />
+      </svg>
+      <p class="files-page__dropzone-text">
+        Drop to upload into <strong>{{ store.fileBrowser.currentPath || 'server' }}</strong>
+      </p>
+    </div>
     <div v-if="store.fileBrowser.absolutePath" class="files-page__location">
       <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
         <path d="M2 3.5A1.5 1.5 0 013.5 2h2.5l1.5 2H11a1.5 1.5 0 011.5 1.5v6A1.5 1.5 0 0111 13H3.5A1.5 1.5 0 012 11.5v-8z" />
@@ -300,7 +512,46 @@ const onCopyPath = async () => {
         >×</button>
       </div>
       <AppButton variant="ghost" size="sm" :loading="store.fileBrowser.loading" @click="onRefresh">Refresh</AppButton>
+      <AppButton variant="ghost" size="sm" @click="openNewFolder">New folder</AppButton>
+      <AppButton variant="primary" size="sm" @click="openFilePicker">Upload</AppButton>
+      <input
+        ref="fileInputRef"
+        type="file"
+        multiple
+        class="files-page__file-input"
+        aria-hidden="true"
+        tabindex="-1"
+        @change="onFilesChosen"
+      />
     </div>
+
+    <!-- Upload queue. Successful rows clear themselves; failures stay until
+         dismissed so an error in a long list isn't missed. -->
+    <ul v-if="store.fileUploads.length" class="files-page__uploads">
+      <li
+        v-for="row in store.fileUploads"
+        :key="row.id"
+        class="files-page__upload"
+        :class="`is-${row.status}`"
+      >
+        <span class="files-page__upload-name">{{ row.name }}</span>
+        <template v-if="row.status === 'uploading'">
+          <span class="files-page__upload-track">
+            <span
+              class="files-page__upload-bar"
+              :class="{ 'is-indeterminate': row.pct < 0 }"
+              :style="row.pct < 0 ? {} : { width: `${row.pct}%` }"
+            />
+          </span>
+          <span class="files-page__upload-pct">{{ row.pct < 0 ? '…' : `${row.pct}%` }}</span>
+          <button type="button" class="files-page__upload-action" @click="store.cancelUpload(row.id)">Cancel</button>
+        </template>
+        <template v-else>
+          <span class="files-page__upload-error">{{ row.error }}</span>
+          <button type="button" class="files-page__upload-action" @click="store.clearFinishedUploads()">Dismiss</button>
+        </template>
+      </li>
+    </ul>
 
     <Panel v-if="store.fileSearch.active" :padded="false">
       <div v-if="store.fileSearch.loading" class="files-page__state">Searching…</div>
@@ -363,6 +614,7 @@ const onCopyPath = async () => {
             <th class="files-page__th-name">Name</th>
             <th class="files-page__th-size">Size</th>
             <th class="files-page__th-modified">Modified</th>
+            <th class="files-page__th-actions"><span class="files-page__visually-hidden">Actions</span></th>
           </tr>
         </thead>
         <tbody>
@@ -400,6 +652,22 @@ const onCopyPath = async () => {
             </td>
             <td class="files-page__td-size">{{ formatFileSize(entry.size) }}</td>
             <td class="files-page__td-modified">{{ formatModified(entry.updatedAt) }}</td>
+            <td class="files-page__td-actions">
+              <button
+                type="button"
+                class="files-page__delete"
+                :title="`Delete ${entry.name}`"
+                :aria-label="`Delete ${entry.name}`"
+                @click.stop="onDeleteClick(entry)"
+              >
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+                  <path d="M2.5 3.5h9" stroke-linecap="round" />
+                  <path d="M5.5 3.5v-1a1 1 0 011-1h1a1 1 0 011 1v1" />
+                  <path d="M3.7 3.5l.5 8a1 1 0 001 .95h3.6a1 1 0 001-.95l.5-8" />
+                  <path d="M5.9 6v4M8.1 6v4" stroke-linecap="round" />
+                </svg>
+              </button>
+            </td>
           </tr>
         </tbody>
       </table>
@@ -472,6 +740,69 @@ const onCopyPath = async () => {
       @confirm="handleInvalidSaveConfirm"
       @cancel="handleInvalidSaveCancel"
     />
+
+    <ConfirmModal
+      :show="showDeleteConfirm"
+      title="Delete?"
+      :message="deleteMessage"
+      :description="deleteDescription"
+      type="danger"
+      confirm-text="Delete"
+      :loading="deleting"
+      loading-text="Deleting..."
+      @confirm="handleDeleteConfirm"
+      @cancel="handleDeleteCancel"
+    />
+
+    <!-- Second pass: the backend declined a non-empty folder, so the cost is
+         spelled out before the recursive retry rather than in the first prompt,
+         where it would cry wolf over every empty folder. -->
+    <ConfirmModal
+      :show="showRecursiveConfirm"
+      title="Delete folder and contents?"
+      :message="recursiveMessage"
+      description="Everything inside will be removed from disk. If this is a world, back it up first — this cannot be undone."
+      type="danger"
+      confirm-text="Delete everything"
+      :loading="deleting"
+      loading-text="Deleting..."
+      @confirm="handleRecursiveConfirm"
+      @cancel="handleRecursiveCancel"
+    />
+
+    <ConfirmModal
+      :show="showReplaceConfirm"
+      title="Replace existing file?"
+      :message="replaceMessage"
+      description="Uploading will overwrite what is there now."
+      type="warning"
+      confirm-text="Replace"
+      @confirm="handleReplaceConfirm"
+      @cancel="handleReplaceCancel"
+    />
+
+    <ConfirmModal
+      :show="showNewFolder"
+      title="New folder"
+      :message="`Create a folder in ${store.fileBrowser.currentPath || 'server'}.`"
+      type="info"
+      confirm-text="Create"
+      :loading="creatingFolder"
+      loading-text="Creating..."
+      @confirm="handleNewFolderConfirm"
+      @cancel="handleNewFolderCancel"
+    >
+      <template #extra>
+        <input
+          v-model="newFolderName"
+          type="text"
+          class="files-page__folder-input"
+          placeholder="Folder name"
+          aria-label="Folder name"
+          @keydown.enter.prevent="handleNewFolderConfirm"
+        />
+      </template>
+    </ConfirmModal>
   </div>
 </template>
 
@@ -498,6 +829,8 @@ const onCopyPath = async () => {
   flex-direction: column;
   gap: var(--space-3);
   min-width: 0;
+  /* Anchors the drag-and-drop overlay. */
+  position: relative;
 }
 
 /* Opening or closing a file is the biggest layout change in the app and it is
@@ -901,5 +1234,213 @@ const onCopyPath = async () => {
   .files-page__td-modified {
     display: none;
   }
+}
+
+/* ---------- File operations (#73) ---------- */
+
+/* Kept in the DOM and driven by the picker button — `display: none` would make
+   it unfocusable in some browsers, and it never needs to be seen. */
+.files-page__file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.files-page__visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.files-page__dropzone {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  /* The listing stays legible underneath, so you can see which folder you are
+     dropping into. */
+  background: color-mix(in srgb, var(--bg-secondary) 88%, transparent);
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius-md);
+  color: var(--accent);
+  pointer-events: none;
+}
+
+.files-page__dropzone-text {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.files-page__dropzone-text strong {
+  color: var(--text-primary);
+}
+
+.files-page__uploads {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.files-page__upload {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  font-size: var(--text-xs);
+}
+
+.files-page__upload.is-failed {
+  border-color: var(--danger);
+}
+
+.files-page__upload-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.files-page__upload-track {
+  flex: 1 1 auto;
+  height: 4px;
+  min-width: 4rem;
+  overflow: hidden;
+  background: var(--bg-tertiary);
+  border-radius: 999px;
+}
+
+.files-page__upload-bar {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: inherit;
+  transition: width 0.2s ease;
+}
+
+/* No Content-Length on the request (a stream, or a proxy that strips it) means
+   no percentage to show — sweep instead of sitting at 0%. */
+.files-page__upload-bar.is-indeterminate {
+  width: 35%;
+  animation: files-page-upload-sweep 1.1s ease-in-out infinite;
+}
+
+@keyframes files-page-upload-sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(340%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .files-page__upload-bar.is-indeterminate {
+    width: 100%;
+    animation: none;
+  }
+}
+
+.files-page__upload-pct {
+  flex: 0 0 auto;
+  color: var(--text-disabled);
+  font-variant-numeric: tabular-nums;
+}
+
+.files-page__upload-error {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--danger);
+}
+
+.files-page__upload-action {
+  flex: 0 0 auto;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.files-page__upload-action:hover {
+  color: var(--text-primary);
+}
+
+.files-page__th-actions,
+.files-page__td-actions {
+  width: 44px;
+  text-align: right;
+}
+
+.files-page__delete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-1);
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-disabled);
+  cursor: pointer;
+  /* Revealed on row hover so the listing stays calm, but never hidden from the
+     keyboard — :focus-visible below brings it back for tab users. */
+  opacity: 0;
+  transition: opacity 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.files-page__row:hover .files-page__delete,
+.files-page__delete:focus-visible {
+  opacity: 1;
+}
+
+.files-page__delete:hover {
+  background: var(--bg-tertiary);
+  color: var(--danger);
+}
+
+/* Touch has no hover, so the affordance would never appear. */
+@media (hover: none) {
+  .files-page__delete {
+    opacity: 1;
+  }
+}
+
+.files-page__folder-input {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+.files-page__folder-input:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 </style>
