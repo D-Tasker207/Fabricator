@@ -651,12 +651,19 @@ export const useServerStore = defineStore('server', () => {
         row.status = 'done'
         uploaded.push(file.name)
       } catch (error) {
-        row.status = 'failed'
         row.error = error?.message || 'Upload failed'
         if (error?.status === 409 && error?.data?.code === 'file-exists') {
+          // Not a failure the user has to read: the replace prompt takes this
+          // file over from here. Marking it 'failed' would leave a red "already
+          // exists" row standing after a successful Replace — and because the
+          // filter below keeps failures, it would outlive every later upload.
+          row.status = 'conflict'
           conflicts.push(file)
-        } else if (error?.message !== 'Upload cancelled') {
-          toast.error(`${file.name}: ${row.error}`, 'Files')
+        } else {
+          row.status = 'failed'
+          if (error?.message !== 'Upload cancelled') {
+            toast.error(`${file.name}: ${row.error}`, 'Files')
+          }
         }
       }
     }
@@ -669,8 +676,9 @@ export const useServerStore = defineStore('server', () => {
       await openFileBrowser(dirPath)
     }
 
-    // Successful rows are transient; failures stay up until the user dismisses
-    // them or starts another upload, so an error isn't missed in a long list.
+    // Successful and conflicting rows are transient; only real failures stay up
+    // until the user dismisses them or starts another upload, so an error in a
+    // long list isn't missed.
     fileUploads.value = fileUploads.value.filter((entry) => entry.status === 'failed')
     return { uploaded, conflicts }
   }

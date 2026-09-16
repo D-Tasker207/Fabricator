@@ -270,8 +270,17 @@ const handleReplaceConfirm = async () => {
 }
 
 const handleReplaceCancel = () => {
+  const skipped = pendingReplace.value.length
   showReplaceConfirm.value = false
   pendingReplace.value = []
+  // The rows for these were dropped with the prompt, so say what happened or
+  // the files would just silently not be there.
+  if (skipped) {
+    toast.info(
+      skipped === 1 ? 'Upload skipped — the file was left as it is' : `${skipped} uploads skipped`,
+      'Files'
+    )
+  }
 }
 
 // dragenter/dragleave fire again for every child element the pointer crosses,
@@ -333,8 +342,11 @@ const deleteMessage = computed(() => {
 const deleteDescription = computed(() => {
   const entry = pendingDelete.value[0]
   if (!entry) return ''
+  // Nothing about contents here — a folder with anything in it comes back from
+  // the backend for a second, explicit confirm, and promising the recursive
+  // delete up front would make that escalation read as a stutter.
   return entry.isDir
-    ? 'Folders and everything inside them are removed from disk. This cannot be undone.'
+    ? 'Empty folders are removed straight away. This cannot be undone.'
     : 'This removes the file from disk and cannot be undone.'
 })
 
@@ -817,6 +829,8 @@ const onCopyPath = async () => {
   flex-direction: column;
   gap: var(--space-3);
   min-width: 0;
+  /* Anchors the drag-and-drop overlay. */
+  position: relative;
 }
 
 /* Opening or closing a file is the biggest layout change in the app and it is
@@ -1223,10 +1237,6 @@ const onCopyPath = async () => {
 }
 
 /* ---------- File operations (#73) ---------- */
-
-.files-page__browser {
-  position: relative;
-}
 
 /* Kept in the DOM and driven by the picker button — `display: none` would make
    it unfocusable in some browsers, and it never needs to be seen. */
