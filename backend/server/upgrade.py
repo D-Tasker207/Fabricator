@@ -20,7 +20,13 @@ from backend.server.locks import get_server_lock
 from backend.server.registry import get_server_process_registry
 
 _SUPPORTED_LOADERS = frozenset({"vanilla", "paper"})
-_RELEASE_VERSION_RE = re.compile(r"^1\.(\d+)(?:\.(\d+))?$")
+
+# A numbered stable release, in either naming scheme Mojang has shipped: the
+# classic ``1.y`` / ``1.y.z`` era and the year-based ``26.n`` / ``26.n.p`` one.
+# Anything carrying a suffix (``1.21-rc1``, ``26.2-snapshot-6``), a weekly
+# snapshot name (``24w14a``), or a legacy alpha/beta name (``b1.7.3``) is
+# deliberately excluded — see :func:`_release_version_key`.
+_RELEASE_VERSION_RE = re.compile(r"^(\d+)\.(\d+)(?:\.(\d+))?$")
 ProgressCallback = Callable[[str, Dict[str, Any]], None]
 
 
@@ -67,21 +73,29 @@ def _discard_rollback_jar(rollback: Path | None) -> None:
         pass
 
 
-def _release_version_key(version: object) -> tuple[int, int]:
+def _release_version_key(version: object) -> tuple[int, int, int]:
     """Convert a stable Minecraft release into a comparable tuple.
 
+    The key is the full ``(major, minor, patch)`` triple rather than just the
+    ``1.y.z`` tail, so the two naming schemes order against each other for
+    free: every year-based release (``26.2`` -> ``(26, 2, 0)``) sorts above
+    every ``1.x`` release (``1.21.4`` -> ``(1, 21, 4)``), which is exactly the
+    real release order. An omitted patch is ``.0`` — Mojang writes ``1.21``
+    and ``26.2`` for what are internally ``1.21.0`` / ``26.2.0``.
+
     Snapshots, release candidates, and non-release legacy version names are
-    intentionally unsupported in the first release. They require semantics
-    beyond the safe one-way release-to-release migration offered here.
+    intentionally unsupported. They require semantics beyond the safe one-way
+    release-to-release migration offered here.
     """
     value = str(version or "").strip()
     match = _RELEASE_VERSION_RE.fullmatch(value)
     if not match:
         raise UpgradeError(
-            "Upgrades currently require stable Minecraft release versions "
-            "such as 1.20.1 or 1.21."
+            "Upgrades currently require numbered Minecraft releases "
+            "such as 1.20.1, 1.21, or 26.3. Snapshots and pre-releases "
+            "are not supported."
         )
-    return int(match.group(1)), int(match.group(2) or 0)
+    return int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
 
 
 def validate_upgrade(server: Dict[str, Any], target_version: object) -> str:

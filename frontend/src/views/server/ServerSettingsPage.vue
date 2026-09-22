@@ -22,14 +22,25 @@ const targetUpgradeVersion = ref('')
 const upgradeStarting = ref(false)
 const upgradePhase = ref('')
 
+// Mirrors the backend's upgrade ordering: a numbered release in either naming
+// scheme ('1.21.4' or the year-based '26.3') parses to a major/minor/patch
+// triple, so the schemes order against each other for free — every 26.x
+// release sorts above every 1.x one. Anything not a bare numeric release
+// (snapshots, '-rc' builds) yields null and is never offered as a target.
+function parseMinecraftRelease(version) {
+  const match = /^(\d+)\.(\d+)(?:\.(\d+))?$/.exec(String(version ?? '').trim())
+  if (!match) return null
+  return [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)]
+}
+
 function isNewerMinecraftRelease(candidate, current) {
-  const parse = (version) => String(version).split('.').map(Number)
-  const [candidateMajor, candidateMinor, candidatePatch = 0] = parse(candidate)
-  const [currentMajor, currentMinor, currentPatch = 0] = parse(current)
-  return candidateMajor === currentMajor && (
-    candidateMinor > currentMinor ||
-    (candidateMinor === currentMinor && candidatePatch > currentPatch)
-  )
+  const a = parseMinecraftRelease(candidate)
+  const b = parseMinecraftRelease(current)
+  if (!a || !b) return false
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return a[i] > b[i]
+  }
+  return false
 }
 
 async function loadUpgradeVersions() {
