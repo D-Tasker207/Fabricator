@@ -22,14 +22,25 @@ const targetUpgradeVersion = ref('')
 const upgradeStarting = ref(false)
 const upgradePhase = ref('')
 
+// Mirrors the backend's upgrade ordering: a numbered release in either naming
+// scheme ('1.21.4' or the year-based '26.3') parses to a major/minor/patch
+// triple, so the schemes order against each other for free — every 26.x
+// release sorts above every 1.x one. Anything not a bare numeric release
+// (snapshots, '-rc' builds) yields null and is never offered as a target.
+function parseMinecraftRelease(version) {
+  const match = /^(\d+)\.(\d+)(?:\.(\d+))?$/.exec(String(version ?? '').trim())
+  if (!match) return null
+  return [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)]
+}
+
 function isNewerMinecraftRelease(candidate, current) {
-  const parse = (version) => String(version).split('.').map(Number)
-  const [candidateMajor, candidateMinor, candidatePatch = 0] = parse(candidate)
-  const [currentMajor, currentMinor, currentPatch = 0] = parse(current)
-  return candidateMajor === currentMajor && (
-    candidateMinor > currentMinor ||
-    (candidateMinor === currentMinor && candidatePatch > currentPatch)
-  )
+  const a = parseMinecraftRelease(candidate)
+  const b = parseMinecraftRelease(current)
+  if (!a || !b) return false
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return a[i] > b[i]
+  }
+  return false
 }
 
 async function loadUpgradeVersions() {
@@ -37,8 +48,15 @@ async function loadUpgradeVersions() {
   try {
     const versions = await getLoaderGameVersions(store.server.loader)
     const current = store.server.version
+    // Filter on "is a numbered release" rather than the loader's `stable`
+    // flag, so this list mirrors exactly what POST /upgrade accepts.
+    // isNewerMinecraftRelease already rejects anything that is not a bare
+    // numbered release, so snapshots and -rc/-pre builds stay out. The
+    // `stable` flag is not usable here: PaperMC marks every year-based
+    // family non-stable, which would leave a 26.x Paper server with an
+    // empty target list even though the upgrade itself is supported.
     upgradeVersions.value = (versions || [])
-      .filter((entry) => entry.stable && isNewerMinecraftRelease(entry.version, current))
+      .filter((entry) => isNewerMinecraftRelease(entry.version, current))
       .map((entry) => entry.version)
     targetUpgradeVersion.value = upgradeVersions.value[0] || ''
   } catch {

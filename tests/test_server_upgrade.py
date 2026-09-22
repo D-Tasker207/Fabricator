@@ -134,6 +134,55 @@ def test_upgrade_rejects_unsupported_loaders_and_downgrades(monkeypatch, loader,
         upgrade.upgrade_server("srv_upgrade", target)
 
 
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        # Year-based releases upgrade among themselves (issue #75).
+        ("26.2", "26.3"),
+        ("26.2", "26.2.1"),
+        ("26.2.1", "26.3"),
+        # ...and the 1.x era still upgrades into the year-based one, since
+        # every 26.x release postdates every 1.x release.
+        ("1.21.4", "26.3"),
+        ("1.20.1", "1.21"),
+    ],
+)
+def test_upgrade_accepts_both_minecraft_naming_schemes(current, target):
+    from backend.server import upgrade
+
+    server = _server(version=current)
+
+    assert upgrade.validate_upgrade(server, target) == target
+
+
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        # A year-based release is never a downgrade target for a 1.x server's
+        # successor, and the reverse direction must stay refused.
+        ("26.3", "1.21.4"),
+        ("26.3", "26.2"),
+        ("26.2.1", "26.2"),
+    ],
+)
+def test_upgrade_rejects_downgrades_across_naming_schemes(current, target):
+    from backend.server import upgrade
+
+    with pytest.raises(upgrade.UpgradeError, match="must be newer"):
+        upgrade.validate_upgrade(_server(version=current), target)
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["26w14a", "26.3-rc1", "26.2-snapshot-6", "1.21-pre1", "b1.7.3", "", "latest"],
+)
+def test_upgrade_still_rejects_non_release_targets(target):
+    from backend.server import upgrade
+
+    with pytest.raises(upgrade.UpgradeError, match="numbered Minecraft releases"):
+        upgrade.validate_upgrade(_server(version="26.2"), target)
+
+
 def test_upgrade_route_starts_a_tracked_upgrade_job(client, tmp_servers_root, monkeypatch):
     import threading
     import time
