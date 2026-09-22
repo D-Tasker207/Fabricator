@@ -48,8 +48,15 @@ async function loadUpgradeVersions() {
   try {
     const versions = await getLoaderGameVersions(store.server.loader)
     const current = store.server.version
+    // Filter on "is a numbered release" rather than the loader's `stable`
+    // flag, so this list mirrors exactly what POST /upgrade accepts.
+    // isNewerMinecraftRelease already rejects anything that is not a bare
+    // numbered release, so snapshots and -rc/-pre builds stay out. The
+    // `stable` flag is not usable here: PaperMC marks every year-based
+    // family non-stable, which would leave a 26.x Paper server with an
+    // empty target list even though the upgrade itself is supported.
     upgradeVersions.value = (versions || [])
-      .filter((entry) => entry.stable && isNewerMinecraftRelease(entry.version, current))
+      .filter((entry) => isNewerMinecraftRelease(entry.version, current))
       .map((entry) => entry.version)
     targetUpgradeVersion.value = upgradeVersions.value[0] || ''
   } catch {
